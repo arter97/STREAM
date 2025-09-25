@@ -47,6 +47,11 @@
 #include <limits.h>
 #include <sys/time.h>
 
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+
 /*-----------------------------------------------------------------------
  * INSTRUCTIONS:
  *
@@ -176,8 +181,11 @@
 #define STREAM_TYPE double
 #endif
 
-static STREAM_TYPE a[STREAM_ARRAY_SIZE + OFFSET],
-    b[STREAM_ARRAY_SIZE + OFFSET], c[STREAM_ARRAY_SIZE + OFFSET];
+static STREAM_TYPE *a, *b, *c;
+
+// static STREAM_TYPE   a[STREAM_ARRAY_SIZE+OFFSET],
+//                      b[STREAM_ARRAY_SIZE+OFFSET],
+//                      c[STREAM_ARRAY_SIZE+OFFSET];
 
 static double avgtime[4] = { 0 }, maxtime[4] = { 0 },
     mintime[4] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
@@ -192,6 +200,109 @@ static double bytes[4] = {
 	3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
 	3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE
 };
+
+static void *alloc_file(size_t len)
+{
+	static const char *path = "/dev/hugepages/test";
+	static struct stat st;
+	static size_t offset = 0;
+	static int fd = -1;
+	static size_t truncated_len = 0;
+	size_t aligned_len;
+	void *ret = NULL;
+
+	if (fd == -1) {
+		const char *alloc_path = getenv("ALLOC_PATH");
+		if (alloc_path)
+			path = alloc_path;
+
+		printf("Using memory: %s\n", path);
+
+		fd = open(path, O_RDWR | O_CREAT, 0666);
+		if (fd == -1) {
+			perror("open");
+			return NULL;
+		}
+		if (fstat(fd, &st) == -1) {
+			perror("fstat");
+			goto out;
+		}
+	}
+
+	size_t align_to_2mb = (len + 2 * 1024 * 1024 - 1) & ~(2 * 1024 * 1024 - 1);
+	if (S_ISREG(st.st_mode) && truncated_len < align_to_2mb) {
+		// printf("Truncating %s to %ld\n", path, align_to_2mb);
+		if (ftruncate(fd, align_to_2mb) == -1) {
+			perror("ftruncate");
+			goto out;
+		}
+		truncated_len = align_to_2mb;
+	}
+	// Align len to 4096
+	aligned_len = (len + 4095) & ~4095;
+
+	printf("mmapping %ld bytes at %ld (original len: %ld)\n", aligned_len, offset, len);
+
+	ret = mmap(NULL, /*offset + */ align_to_2mb, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (ret == MAP_FAILED) {
+		// printf("mmapping %ld bytes at %ld (original len: %ld)\n", aligned_len, offset, len);
+		perror("mmap");
+		ret = NULL;
+		goto out;
+	}
+
+	offset += aligned_len;
+
+ out:
+	// close(fd);
+	return ret;
+}
+
+#include <sys/wait.h>
+
+static void ack_host(void)
+{
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		perror("fork failed");
+		return;
+	}
+
+	if (pid == 0) {
+		// Child process
+
+		// Open /dev/null for reading
+		int fd = open("/dev/null", O_RDONLY);
+		if (fd < 0) {
+			perror("open /dev/null failed");
+			return;
+		}
+		// Redirect stdin to /dev/null
+		if (dup2(fd, STDIN_FILENO) < 0) {
+			perror("dup2 failed");
+			return;
+		}
+		close(fd);
+
+		// Execute nc with -N, host, port
+		execlp("nc", "nc", "-N", "10.150.21.10", "5000", (char *)NULL);
+
+		// If execlp returns, there was an error
+		perror("execlp failed");
+		return;
+	} else {
+		// Parent process
+		int status;
+		waitpid(pid, &status, 0);
+		if (WIFEXITED(status)) {
+			printf("Child exited with status %d\n", WEXITSTATUS(status));
+		} else if (WIFSIGNALED(status)) {
+			printf("Child killed by signal %d\n", WTERMSIG(status));
+		}
+	}
+	sleep(1);
+}
 
 extern double mysecond();
 extern void checkSTREAMresults();
@@ -212,6 +323,25 @@ int main()
 	ssize_t j;
 	STREAM_TYPE scalar;
 	double t, times[4][NTIMES];
+
+	// Setup memory
+	size_t single = ((((STREAM_ARRAY_SIZE + OFFSET) * sizeof(STREAM_TYPE)) + 4095) & ~4095);
+	printf("single: %ld\n", single);
+	size_t len = single * 8;
+	void *mem = alloc_file(len);
+	if (mem == NULL) {
+		printf("Failed to allocate memory\n");
+		return 1;
+	}
+	a = (STREAM_TYPE *) (mem + single * 0);
+	b = (STREAM_TYPE *) (mem + single * 1);
+	c = (STREAM_TYPE *) (mem + single * 2);
+
+	// print mem, a, b, c
+	printf("mem: %p, a: %p, b: %p, c: %p\n", mem, a, b, c);
+	printf("mem: %ld, a: %ld, b: %ld, c: %ld\n",
+	       (size_t)mem,
+	       (size_t)((void *)a - mem), (size_t)((void *)b - mem), (size_t)((void *)c - mem));
 
 	/* --- SETUP --- determine precision and check timing --- */
 
@@ -310,6 +440,8 @@ int main()
 		tuned_STREAM_Copy();
 #else
 #pragma omp parallel for
+		ack_host();
+		// Copy
 		for (j = 0; j < STREAM_ARRAY_SIZE; j++)
 			c[j] = a[j];
 #endif
@@ -320,6 +452,8 @@ int main()
 		tuned_STREAM_Scale(scalar);
 #else
 #pragma omp parallel for
+		ack_host();
+		// Scale
 		for (j = 0; j < STREAM_ARRAY_SIZE; j++)
 			b[j] = scalar * c[j];
 #endif
@@ -330,6 +464,8 @@ int main()
 		tuned_STREAM_Add();
 #else
 #pragma omp parallel for
+		ack_host();
+		// Add
 		for (j = 0; j < STREAM_ARRAY_SIZE; j++)
 			c[j] = a[j] + b[j];
 #endif
@@ -340,6 +476,8 @@ int main()
 		tuned_STREAM_Triad(scalar);
 #else
 #pragma omp parallel for
+		ack_host();
+		// Triad
 		for (j = 0; j < STREAM_ARRAY_SIZE; j++)
 			a[j] = b[j] + scalar * c[j];
 #endif
